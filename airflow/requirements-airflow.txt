@@ -1,0 +1,2 @@
+# Airflow-specific requirements
+duckdb==0.9.2
