@@ -1,0 +1,287 @@
+# WARNING: Development configuration only. Contains default credentials.
+version: '3.8'
+
+services:
+  # Zookeeper for Kafka
+  zookeeper:
+    image: docker.io/confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - observability
+
+  # Kafka broker
+  kafka:
+    image: docker.io/confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    networks:
+      - observability
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Kafka topic initialization
+  kafka-init:
+    image: docker.io/confluentinc/cp-kafka:7.5.0
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic raw_events --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic aggregated_metrics --partitions 1 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic anomalies --partitions 1 --replication-factor 1
+      echo 'Kafka topics created successfully'
+      "
+    networks:
+      - observability
+
+  # Ollama for local LLM
+  ollama:
+    image: docker.io/ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+    environment:
+      NO_PROXY: localhost,127.0.0.1
+      no_proxy: localhost,127.0.0.1
+    networks:
+      - observability
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Ollama model initialization
+  ollama-init:
+    image: docker.io/ollama/ollama:latest
+    container_name: ollama-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      sleep 10
+      ollama pull phi
+      echo 'Ollama model phi pulled successfully'
+      "
+    environment:
+      OLLAMA_HOST: ollama:11434
+
+      NO_PROXY: localhost,127.0.0.1,ollama
+      no_proxy: localhost,127.0.0.1,ollama
+    networks:
+      - observability
+
+  # Event Generator
+  event-generator:
+    build:
+      context: ./event_generator
+      dockerfile: Dockerfile
+    container_name: event-generator
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER: kafka:9092
+      KAFKA_RAW_EVENTS_TOPIC: raw_events
+      ANOMALY_PROBABILITY: 0.05
+    volumes:
+      - ./event_generator:/app
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # Spark Streaming Job
+  spark:
+    image: docker.io/bitnami/spark:3.5.0
+    container_name: spark-streaming
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      SPARK_MODE: master
+      SPARK_MASTER_URL: spark://spark:7077
+      KAFKA_BROKER: kafka:9092
+      DUCKDB_PATH: /data/observability.db
+    volumes:
+      - ./spark:/app
+      - ./data:/data
+      - spark_jars:/opt/bitnami/spark/jars
+    command: >
+      /bin/bash -c "
+      pip install kafka-python duckdb &&
+      /opt/bitnami/spark/bin/spark-submit
+      --master local[*]
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0
+      --driver-memory 1g
+      --executor-memory 1g
+      /app/streaming_job.py
+      "
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # Anomaly Detection Service
+  anomaly-detector:
+    build:
+      context: ./anomaly_detection
+      dockerfile: Dockerfile
+    container_name: anomaly-detector
+    depends_on:
+      - spark
+    environment:
+      DUCKDB_PATH: /data/observability.db
+      CHECK_INTERVAL_SECONDS: 60
+    volumes:
+      - ./anomaly_detection:/app
+      - ./data:/data
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # LLM Narrator Service
+  llm-narrator:
+    build:
+      context: ./llm
+      dockerfile: Dockerfile
+    container_name: llm-narrator
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      DUCKDB_PATH: /data/observability.db
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: phi
+      CHECK_INTERVAL_SECONDS: 60
+    volumes:
+      - ./llm:/app
+      - ./data:/data
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # Airflow PostgreSQL
+  postgres:
+    image: docker.io/postgres:14
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - observability
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Airflow Webserver
+  airflow-webserver:
+    image: apache/airflow:2.8.0-python3.11
+    container_name: airflow-webserver
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+      AIRFLOW__CORE__FERNET_KEY: 'your-generated-key-here'
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__WEBSERVER__SECRET_KEY: 'secret'
+      AIRFLOW_UID: 50000
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./data:/data
+    ports:
+      - "8080:8080"
+    command: >
+      bash -c "
+      airflow db init &&
+      airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password admin &&
+      airflow webserver
+      "
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # Airflow Scheduler
+  airflow-scheduler:
+    image: apache/airflow:2.8.0-python3.11
+    container_name: airflow-scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__FERNET_KEY: 'ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg='
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW_UID: 50000
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./data:/data
+    command: airflow scheduler
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # Streamlit Dashboard
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: dashboard
+    environment:
+      DUCKDB_PATH: /data/observability.db
+    volumes:
+      - ./dashboard:/app
+      - ./data:/data
+    ports:
+      - "8501:8501"
+    networks:
+      - observability
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+  postgres_data:
+  spark_jars:
+
+networks:
+  observability:
+    driver: bridge
