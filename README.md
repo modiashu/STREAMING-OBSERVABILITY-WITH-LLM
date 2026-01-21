@@ -1,10 +1,26 @@
 # Streaming Observability Platform
 
-A production-style, local streaming observability platform that demonstrates real-time telemetry processing, anomaly detection, and LLM-based incident explanation generation.
+A **learning-first, local-first** streaming observability platform that processes real-time telemetry, detects anomalies, and uses a **local LLM** to generate human-friendly summaries.
+
+This repository accompanies a Medium article that explains the *why* behind the architecture, design decisions, and key lessons learned:
+https://medium.com/@modiashutoshd/end-to-end-streaming-observability-platform-with-llms-b74bf0c0399f
+
+---
+
+## 🚀 Project Purpose
+
+This project was built not to be production-ready, but to:
+
+- Learn core streaming concepts by *doing*
+- Explore how **LLMs (and tools like Copilot)** can accelerate learning
+- Experience how to integrate an LLM into a real pipeline *responsibly*  
+  (only aggregated metrics — no raw events sent to the model)
+
+---
 
 ## 🎯 Overview
 
-This project showcases senior data engineering skills through a complete, working observability pipeline that:
+This project showcases data engineering skills through a complete, working observability pipeline that:
 - Ingests and processes service telemetry in near-real-time
 - Performs windowed aggregations using Spark Structured Streaming
 - Detects anomalies using rule-based algorithms
